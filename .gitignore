@@ -1,0 +1,21 @@
+# Secrets: never commit these
+*.env
+.env*
+service-account*.json
+**/google-services.json
+**/GoogleService-Info.plist
+
+# Firebase
+.firebase/
+*-debug.log
+firebase-export-*/
+
+# Node
+functions/node_modules/
+functions/lib/
+
+# Flutter (app/.gitignore covers the rest after `flutter create`)
+app/build/
+app/.dart_tool/
+
+.DS_Store

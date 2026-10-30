@@ -1,0 +1,21 @@
+rules_version = '2';
+
+// Voice notes and photos live under users/{uid}/. Same pattern as Firestore:
+// the owner and admins can read; only the owner can upload or delete.
+service firebase.storage {
+  match /b/{bucket}/o {
+    match /users/{uid}/{allPaths=**} {
+      allow read: if request.auth != null
+        && (request.auth.uid == uid || request.auth.token.role == 'admin');
+      allow create, update: if request.auth != null && request.auth.uid == uid
+        && request.resource.size < 10 * 1024 * 1024
+        && request.resource.contentType.matches('audio/.*|image/.*');
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Data exports are only reachable through a short-lived signed URL.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

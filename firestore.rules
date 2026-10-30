@@ -1,0 +1,157 @@
+rules_version = '2';
+
+// Who can read and write what. See docs/ARCHITECTURE.md > Security rules.
+// Every rule here has a test in functions/test/rules/firestore.rules.test.ts.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && request.auth.token.role == 'admin'; }
+    function isOwner(uid) { return signedIn() && request.auth.uid == uid; }
+    function incoming() { return request.resource.data; }
+    function changedKeys() { return incoming().diff(resource.data).affectedKeys(); }
+    function profile(uid) { return get(/databases/$(database)/documents/users/$(uid)).data; }
+    function notBlocked(uid) { return profile(uid).get('blocked', false) != true; }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+
+      // Under-18 age ranges are never accepted (docs/SAFETY.md).
+      allow create: if isOwner(uid)
+        && incoming().ageRange in ['18-29', '30-44', '45-59', '60+']
+        && incoming().group in ['adult', 'mother', 'senior']
+        && incoming().status == 'active'
+        && incoming().consentVersion is string
+        && incoming().consentAt == request.time
+        && !('blocked' in incoming())
+        && !('deletionRequestedAt' in incoming());
+
+      // Users edit their own profile but not moderation or deletion fields.
+      // They may only move between active and paused (take a break).
+      allow update: if (isOwner(uid)
+          && !changedKeys().hasAny(['blocked', 'deletionRequestedAt', 'createdAt', 'consentAt', 'ageRange'])
+          && (!changedKeys().hasAny(['status'])
+              || (resource.data.status in ['active', 'paused']
+                  && incoming().status in ['active', 'paused'])))
+        || (isAdmin() && changedKeys().hasOnly(['blocked']));
+
+      allow delete: if false;
+
+      match /moods/{id} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create: if isOwner(uid)
+          && incoming().score is int && incoming().score >= 1 && incoming().score <= 5
+          && incoming().createdAt == request.time;
+        allow delete: if isOwner(uid);
+        allow update: if false;
+      }
+
+      // Private by default: admin sees an entry only when the user shared it.
+      match /journal/{id} {
+        allow read: if isOwner(uid) || (isAdmin() && resource.data.sharedWithAdmin == true);
+        allow create, update: if isOwner(uid)
+          && incoming().text is string && incoming().text.size() <= 20000
+          && incoming().sharedWithAdmin is bool;
+        allow delete: if isOwner(uid);
+      }
+
+      match /epds/{id} {
+        allow read: if isOwner(uid) || isAdmin();
+        allow create: if isOwner(uid)
+          && incoming().answers is list && incoming().answers.size() == 10
+          && incoming().createdAt == request.time;
+        allow delete: if isOwner(uid);
+        allow update: if false;
+      }
+
+      // "I need help now" taps. Written by the app (works offline, syncs later).
+      match /helpTaps/{id} {
+        allow create: if isOwner(uid) && incoming().createdAt == request.time;
+        allow read: if isAdmin();
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- conversations ----------
+    match /conversations/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      // Created and mostly updated by Cloud Functions.
+      allow create, delete: if false;
+      allow update: if (isOwner(uid)
+          && changedKeys().hasOnly(['unreadForUser']) && incoming().unreadForUser == 0)
+        || (isAdmin() && changedKeys().hasOnly(['unreadForAdmin', 'urgent', 'watch']));
+
+      match /messages/{messageId} {
+        allow read: if isOwner(uid) || isAdmin();
+
+        // Users can only write as 'user' and can never set safety flags.
+        // Photos are for adults only.
+        allow create: if (isOwner(uid) && notBlocked(uid)
+            && incoming().keys().hasOnly(['sender', 'type', 'text', 'audioPath', 'imagePath',
+                                          'transcript', 'transcriptConfidence', 'createdAt', 'deleted', 'seenAt'])
+            && incoming().sender == 'user'
+            && incoming().type in ['text', 'voice', 'image']
+            && incoming().text is string && incoming().text.size() <= 4000
+            && incoming().createdAt == request.time
+            && incoming().deleted == false
+            && incoming().seenAt == null
+            && (incoming().type != 'image' || profile(uid).group == 'adult'))
+          || (isAdmin()
+            && incoming().keys().hasOnly(['sender', 'type', 'text', 'createdAt', 'deleted', 'seenAt'])
+            && incoming().sender == 'admin'
+            && incoming().type == 'text'
+            && incoming().text is string && incoming().text.size() <= 4000
+            && incoming().createdAt == request.time);
+
+        // Users can delete (blank out) their own messages and mark the other
+        // side's messages as seen. Admin can only mark user messages as seen.
+        allow update: if (isOwner(uid) && resource.data.sender == 'user'
+            && changedKeys().hasOnly(['deleted', 'text', 'transcript', 'audioPath', 'imagePath'])
+            && incoming().deleted == true && incoming().text == '')
+          || (isOwner(uid) && resource.data.sender != 'user'
+            && changedKeys().hasOnly(['seenAt']))
+          || (isAdmin() && resource.data.sender == 'user'
+            && changedKeys().hasOnly(['seenAt']));
+
+        allow delete: if false;
+      }
+    }
+
+    // ---------- admin-only ----------
+    match /alerts/{id} {
+      allow read: if isAdmin();
+      allow update: if isAdmin() && changedKeys().hasOnly(['resolvedAt', 'resolvedBy']);
+      allow create, delete: if false;
+    }
+
+    match /config/helplines {
+      // Public phone numbers; readable before sign-in so the crisis screen can show extras.
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /config/{doc} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /quickReplies/{id} {
+      allow read, write: if isAdmin();
+    }
+
+    match /reports/{id} {
+      allow read, create: if isAdmin();
+      allow update, delete: if false;
+    }
+
+    match /adminTokens/{uid} {
+      allow read, write: if isAdmin() && request.auth.uid == uid;
+    }
+
+    // Everything else (stats, exports bookkeeping) is server-only.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
